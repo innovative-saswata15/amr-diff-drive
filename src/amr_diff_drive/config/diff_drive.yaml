@@ -1,0 +1,29 @@
+diff_drive_controller:
+  ros__parameters:
+    # Geometry
+    wheel_radius: 0.056          # m
+    wheel_separation: 0.39       # m, wheel centre to wheel centre
+
+    # Command side
+    max_wheel_speed: 18.0        # rad/s; both wheels scaled together to keep curvature. <= 0 disables
+    cmd_vel_timeout: 0.5         # s; wheels commanded to 0 if no cmd_vel for this long
+    invert_left_cmd: false
+    invert_right_cmd: false
+
+    # Encoder side
+    encoder_topic: /encoder_telemetry
+    left_joint_name: left_wheel
+    right_joint_name: right_wheel
+    invert_left_encoder: false
+    invert_right_encoder: false
+    encoder_timeout: 0.5         # s; odom twist reported as 0 if encoders go silent
+    max_wheel_delta: 10.0        # rad per encoder msg; larger jumps (encoder reset) are ignored
+
+    # Output
+    cmd_vel_topic: /cmd_vel
+    publish_rate: 50.0           # Hz for /left_vel, /right_vel, /odom, TF
+    odom_frame: odom
+    base_frame: base_link
+    publish_tf: true
+    pose_covariance_diagonal:  [0.001, 0.001, 1000000.0, 1000000.0, 1000000.0, 0.01]
+    twist_covariance_diagonal: [0.001, 0.001, 1000000.0, 1000000.0, 1000000.0, 0.01]
