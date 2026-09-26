@@ -18,13 +18,13 @@ All outputs are published at **50 Hz** from a single timer.
 | Topic | Type | Units | Notes |
 |---|---|---|---|
 | `/cmd_vel` | `geometry_msgs/msg/Twist` | `linear.x` m/s, `angular.z` rad/s | Other fields are ignored (a diff drive can't move sideways). QoS: reliable, depth 10. |
-| `/encoder_telemetry` | `sensor_msgs/msg/JointState` | `position` rad, `velocity` rad/s | Wheels are looked up **by name** (`left_wheel`, `right_wheel`), not by array index. QoS: best-effort (sensor data), which works with both reliable and best-effort publishers. |
+| `/encoder_telemetry` | `sensor_msgs/msg/JointState` | `position` rad, `velocity` rad/s, `header.stamp` = measurement time | Wheels are looked up **by name** (`left_wheel`, `right_wheel`), not by array index. `header.stamp` (set by the ESP32) is used for latency compensation when it is valid (see section 7.3). QoS: best-effort (sensor data), which works with both reliable and best-effort publishers. |
 
 Expected encoder message format:
 
 ```yaml
 header:
-  stamp: {sec: 1790359259, nanosec: 594341871}
+  stamp: {sec: 1790359259, nanosec: 594341871}   # time the ESP32 measured the sample, on the Pi's clock
   frame_id: ''
 name: [left_wheel, right_wheel]
 position: [6698.438452980677, 7147.911794138329]   # rad, cumulative
@@ -138,7 +138,7 @@ ros2 run amr_diff_drive diff_drive_controller --ros-args \
 On startup the node logs a line like this:
 
 ```
-diff_drive_controller up: r=0.056 m, L=0.39 m, max_wheel_speed=18.0 rad/s, rate=50.0 Hz, odom->base_link, cmd="/cmd_vel", encoders="/encoder_telemetry"
+diff_drive_controller up: r=0.056 m, L=0.39 m, max_wheel_speed=18.0 rad/s, rate=50.0 Hz, odom->base_link, cmd="/cmd_vel", encoders="/encoder_telemetry", use_encoder_stamp=True
 ```
 
 It logs another line when the first encoder message arrives:
@@ -193,6 +193,10 @@ ros2 run tf2_ros tf2_echo odom base_link
 | `invert_right_encoder` | bool | `false` | Negate the right encoder position and velocity. |
 | `encoder_timeout` | double | `0.5` | Seconds without encoder messages before the odom twist is reported as 0 and a warning is logged. The pose is kept. |
 | `max_wheel_delta` | double | `10.0` | Largest wheel angle change (rad) accepted between two encoder messages. A larger jump is treated as an encoder reset or glitch: it is ignored and the reference point is reset (see section 8). |
+| `use_encoder_stamp` | bool | `true` | Use the ESP32 `header.stamp` as the measurement time and predict the published pose forward to "now" (section 7.3). `false` = ignore the stamp, with no prediction (the original behaviour). |
+| `max_stamp_offset` | double | `0.5` | Largest allowed \|receive time − stamp\| in s. A bigger offset means the ESP32 clock isn't synced to the Pi, so the receive time is used instead. |
+| `max_extrapolation_time` | double | `0.2` | Longest time (s) the pose is predicted forward. If the sample is older than this, or the age is ≤ 0, the pose is published as measured. |
+| `latency_report_period` | double | `10.0` | How often (s) to log encoder latency statistics. `0` turns it off. |
 | `cmd_vel_topic` | string | `/cmd_vel` | Twist input topic. |
 | `publish_rate` | double | `50.0` | Hz for all outputs. Must be > 0. |
 | `odom_frame` | string | `odom` | `header.frame_id` of odom and TF. |
@@ -248,7 +252,34 @@ Worked examples (r = 0.056, L = 0.39, limit 18 rad/s):
 
 ### 7.3 Publishing (50 Hz timer)
 
-Each tick publishes `/left_vel`, `/right_vel`, `/odom` and the TF, stamped with the **node's clock (`now`)**. The encoder header stamp isn't used, because the telemetry repeats the same stamp across messages with different data. The pose in `/odom` is the latest integrated pose, which is at most one encoder period old.
+Each tick publishes `/left_vel`, `/right_vel`, `/odom` and the TF, stamped with the **node's clock (`now`)**. The stamps are therefore monotonic and exactly 50 Hz, with no `TF_REPEATED_DATA`.
+
+**Latency compensation using the ESP32 stamp.** An encoder sample reaches the Pi 20–150 ms after the ESP32 measured it. Without compensation, `/odom` stamped `now` shows where the robot *was*. At 0.5 m/s and 1 rad/s with 60 ms latency, that's about 40 mm and 4.5° behind, which smears LiDAR scans in SLAM. So:
+
+1. **Measurement time.** For every encoder message:
+   - `stamp_ns = header.stamp`
+   - `receive_ns = now`
+
+   The stamp is **accepted** only if all of these hold:
+   - it is non-zero
+   - it is strictly greater than the previous message's stamp
+   - \|receive_ns − stamp_ns\| ≤ `max_stamp_offset` (0.5 s), meaning the clocks are synced
+
+   If accepted, the measurement time is `stamp_ns`. Otherwise it is `receive_ns`, and a throttled warning is logged. The integrated pose is the pose **at the measurement time**. Position integration itself is unchanged; it uses position differences and doesn't depend on time.
+2. **Prediction.** Every 50 Hz tick computes `age = now − measurement time`. If `0 < age ≤ max_extrapolation_time` (0.2 s), the published pose is
+   `integrate_pose(pose, ω_L·age, ω_R·age)`: the same exact arc integration, using the measured wheel speeds. Otherwise the measured pose is published unchanged.
+3. The prediction is **only used for publishing**. It is never written back into the integrated pose, so prediction errors can't pile up. The twist in `/odom` is the measured one, not predicted.
+4. When encoders are stale (> `encoder_timeout`), there is no prediction. The stale check always uses the **receive** time, so a bad stamp can't hide a dead link.
+
+Every `latency_report_period` seconds the node logs, for example:
+```
+encoder latency ms: min 60.2 / mean 63.4 / max 80.7, stamps rejected 0/150
+```
+If every stamp is rejected it logs `encoder stamps rejected 150/150; running on receive time (no latency compensation)` instead.
+
+**Clock requirement.** The ESP32 stamps must be on the **Pi's clock** (for example micro-ROS time sync, `rmw_uros_sync_session`). Don't change the Pi's system time while the robot is running.
+
+> Note: a guide written for **ros2_control** (C++ `SystemInterface`, `update_rate`, stock `diff_drive_controller` YAML with `open_loop` / `position_feedback`, URDF `<ros2_control>` block) does **not** apply to this package. This node reads `/encoder_telemetry` directly and does the same "store the stamp, predict to now" itself. Don't run a ros2_control `diff_drive_controller` at the same time: there must be only one `odom → base_link` publisher.
 
 ---
 
@@ -263,6 +294,10 @@ Each tick publishes `/left_vel`, `/right_vel`, `/odom` and the TF, stamped with 
 | Encoder jumps by more than `max_wheel_delta` (10 rad) in one message (for example a microcontroller restart that resets the position to 0) | Pose is **not** moved. The new position becomes the reference and a warning is logged. |
 | No encoder messages for > 0.5 s | Odom twist reported as 0 and the last pose is kept. Warning: `Encoder telemetry stale`. `/odom` and TF keep publishing at 50 Hz. |
 | No encoder messages since startup | `/odom` and TF publish pose `(0, 0, 0)` with zero twist |
+| Encoder `header.stamp` is zero | Receive time used, no latency compensation; warning `Encoder stamp not used (zero stamp)` |
+| Encoder `header.stamp` repeats or goes backwards | Receive time used for that message; warning `... (stamp not increasing)` |
+| Encoder stamp more than 0.5 s from the Pi's clock (ESP32 not synced, e.g. boot-time clock) | Receive time used; warning `... (stamp offset X s (ESP32 clock not synced to Pi?))` |
+| Sample older than `max_extrapolation_time` (0.2 s) | Pose published as measured, without prediction |
 | Invalid geometry (radius/separation ≤ 0), rate ≤ 0, or wrong covariance length | Node refuses to start (ValueError) |
 
 At the 18 rad/s limit and 50 Hz, a normal change per encoder message is about 0.36 rad, so 10 rad leaves a lot of margin. Raise `max_wheel_delta` only if encoder messages can go missing for longer than about 0.5 s while the robot is moving.
@@ -306,7 +341,9 @@ Edit `config/diff_drive.yaml`, restart, and repeat until the error is under abou
 
 ## 11. Tests
 
-Unit tests cover the kinematics: inverse kinematics, the speed limit preserving the curve, forward/inverse round trips, straight-line integration, a closed circle returning to the origin, and an exact quarter arc.
+20 unit tests cover:
+- **Kinematics:** inverse kinematics, the speed limit preserving the curve, forward/inverse round trips, straight-line integration, a closed circle returning to the origin, and an exact quarter arc.
+- **Timestamps:** stamp conversion; accepting valid, first and slightly-future stamps; rejecting zero, repeated, decreasing and boot-time stamps; prediction for zero, negative and over-cap ages, straight lines and spins.
 
 ```bash
 cd ~/Desktop/final_hoja_pls/src/amr_diff_drive
@@ -324,6 +361,17 @@ Results from the live test against a simulated robot:
 | cmd_vel (0.2, 0.5) | odom v = 0.2000, ω = 0.5000; yaw rate measured from the pose = 0.5000 rad/s |
 | cmd_vel stopped | wheels 0.0 within 0.5 s |
 
+Latency compensation: a fake ESP32 delivers encoder data 60 ms or 150 ms late, stamped with the true measurement time. The robot drives an arc at v = 0.5 m/s, ω = 1.0 rad/s, and `/odom` is compared with ground truth at the same time:
+
+| Case | Position error (mean) | Yaw error (mean) |
+|---|---|---|
+| 60 ms, `use_encoder_stamp: false` | 39.3 mm | 4.51° |
+| 60 ms, `use_encoder_stamp: true` | **0.1 mm** | **0.01°** |
+| 150 ms, `use_encoder_stamp: true` | **0.1 mm** | **0.01°** |
+| 60 ms, zero / repeated / boot-time stamps (fallback) | ≈ 31 mm | ≈ 3.5° |
+
+The fallback cases printed the matching warning, and none of them made the odometry jump.
+
 ---
 
 ## 12. Troubleshooting
@@ -336,5 +384,10 @@ Results from the live test against a simulated robot:
 | Robot goes slower than commanded | Expected above 1.008 m/s because of the 18 rad/s limit. Raise `max_wheel_speed` only if the motors can handle it. |
 | `Encoder jump ignored` warnings during normal driving | Encoder messages are too far apart or the values are noisy. Raise `max_wheel_delta`. |
 | `Encoder telemetry stale` warnings | Encoder publisher is slower than 2 Hz or stopped. |
+| `Encoder stamp not used (zero stamp)` | Firmware isn't filling `header.stamp`. |
+| `Encoder stamp not used (stamp not increasing)` | Firmware sends the same stamp repeatedly: set the stamp for every sample, when it is measured. Check with `ros2 topic echo /encoder_telemetry --field header.stamp`; `nanosec` must change every message. |
+| `Encoder stamp not used (stamp offset X s ...)` | ESP32 clock not synced to the Pi (for example it counts from boot). Enable micro-ROS time sync, or set `use_encoder_stamp: false`. |
+| Latency log mean jumps around or is > 200 ms | Serial or Wi-Fi link overloaded, or the Pi is under heavy load. Samples older than 0.2 s aren't predicted. |
+| Walls still smear in RViz during spins | Check the latency log shows 0 rejected stamps; check the LiDAR static TF (`base_link → laser`) x, y, yaw, and roll = π if mounted upside down; check SLAM `base_frame: base_link`. |
 | Two nodes publishing `odom → base_link` (TF flickers) | Set `publish_tf: false` if an EKF or another node owns that transform. |
 | Odom drifts over distance or rotation | Calibrate (section 10). |

@@ -19,6 +19,12 @@ diff_drive_controller:
     encoder_timeout: 0.5         # s; odom twist reported as 0 if encoders go silent
     max_wheel_delta: 10.0        # rad per encoder msg; larger jumps (encoder reset) are ignored
 
+    # Encoder timestamps (ESP32 header.stamp) -> latency compensation
+    use_encoder_stamp: true      # false = ignore header.stamp, no pose prediction (old behaviour)
+    max_stamp_offset: 0.5        # s; |receive - stamp| above this => clocks not synced, use receive time
+    max_extrapolation_time: 0.2  # s; pose predicted to "now" only if 0 < age <= this
+    latency_report_period: 10.0  # s; periodic latency log, 0 disables
+
     # Output
     cmd_vel_topic: /cmd_vel
     publish_rate: 50.0           # Hz for /left_vel, /right_vel, /odom, TF

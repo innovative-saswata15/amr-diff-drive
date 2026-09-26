@@ -62,3 +62,41 @@ def integrate_pose(x, y, theta, d_left, d_right, wheel_radius, wheel_separation)
 def yaw_to_quaternion(yaw):
     """Planar yaw -> (x, y, z, w) quaternion."""
     return 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+
+
+def stamp_to_ns(sec, nanosec):
+    """builtin_interfaces/Time fields -> integer nanoseconds."""
+    return int(sec) * 1_000_000_000 + int(nanosec)
+
+
+def select_sample_time(stamp_ns, receive_ns, last_stamp_ns, max_offset_ns):
+    """Pick the time an encoder sample was measured.
+
+    The sender's stamp is trusted only if it is non-zero, strictly newer than
+    the previous message's stamp (last_stamp_ns, None if there is none), and
+    within max_offset_ns of the local receive time (i.e. the clocks look
+    synchronised). Otherwise the receive time is used.
+    Returns (sample_ns, accepted, reason); reason is '' when accepted.
+    """
+    if stamp_ns <= 0:
+        return receive_ns, False, 'zero stamp'
+    if last_stamp_ns is not None and stamp_ns <= last_stamp_ns:
+        return receive_ns, False, 'stamp not increasing'
+    offset_ns = receive_ns - stamp_ns
+    if abs(offset_ns) > max_offset_ns:
+        return (receive_ns, False,
+                f'stamp offset {offset_ns * 1e-9:.3f} s (ESP32 clock not synced to Pi?)')
+    return stamp_ns, True, ''
+
+
+def predict_pose(x, y, theta, left_vel, right_vel, age,
+                 wheel_radius, wheel_separation, max_age):
+    """Extrapolate a pose forward by `age` seconds at constant wheel speeds.
+
+    Returns the pose unchanged when age <= 0 or age > max_age (no trustworthy
+    prediction possible).
+    """
+    if age <= 0.0 or age > max_age:
+        return x, y, theta
+    return integrate_pose(x, y, theta, left_vel * age, right_vel * age,
+                          wheel_radius, wheel_separation)

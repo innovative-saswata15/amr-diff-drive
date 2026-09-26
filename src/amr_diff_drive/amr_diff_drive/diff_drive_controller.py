@@ -25,6 +25,9 @@ from tf2_ros import TransformBroadcaster
 
 from amr_diff_drive.kinematics import (
     integrate_pose,
+    predict_pose,
+    select_sample_time,
+    stamp_to_ns,
     twist_to_wheels,
     wheels_to_twist,
     yaw_to_quaternion,
@@ -45,6 +48,10 @@ class DiffDriveController(Node):
         self.publish_rate = p('publish_rate', 50.0).value             # Hz
         self.encoder_timeout = p('encoder_timeout', 0.5).value        # s, warning only
         self.max_wheel_delta = p('max_wheel_delta', 10.0).value       # rad per encoder msg
+        self.use_encoder_stamp = p('use_encoder_stamp', True).value
+        self.max_stamp_offset = p('max_stamp_offset', 0.5).value      # s
+        self.max_extrapolation_time = p('max_extrapolation_time', 0.2).value  # s
+        self.latency_report_period = p('latency_report_period', 10.0).value   # s, 0 disables
         self.left_joint = p('left_joint_name', 'left_wheel').value
         self.right_joint = p('right_joint_name', 'right_wheel').value
         self.invert_left_cmd = p('invert_left_cmd', False).value
@@ -69,6 +76,10 @@ class DiffDriveController(Node):
             raise ValueError('publish_rate must be > 0')
         if len(self.pose_cov_diag) != 6 or len(self.twist_cov_diag) != 6:
             raise ValueError('covariance diagonals must have 6 elements')
+        if min(self.max_stamp_offset, self.max_extrapolation_time,
+               self.latency_report_period) < 0.0:
+            raise ValueError('max_stamp_offset, max_extrapolation_time and '
+                             'latency_report_period must be >= 0')
 
         # ---------------- State ----------------
         self.cmd_left = 0.0
@@ -82,7 +93,18 @@ class DiffDriveController(Node):
         self.w = 0.0
         self.prev_left_pos = None
         self.prev_right_pos = None
-        self.last_enc_time = None
+        self.last_enc_time = None       # local receive time (watchdog)
+
+        # Encoder timing: the pose above is the pose at sample_ns.
+        self.sample_ns = None           # measurement time of the stored pose
+        self.last_stamp_ns = None       # previous non-zero header stamp
+        self.left_vel_meas = 0.0        # rad/s, sign-corrected
+        self.right_vel_meas = 0.0
+        self.lat_min = math.inf         # receive - stamp stats, s
+        self.lat_max = -math.inf
+        self.lat_sum = 0.0
+        self.lat_count = 0
+        self.stamp_rejected = 0
 
         # ---------------- ROS interfaces ----------------
         self.left_pub = self.create_publisher(Float64, '/left_vel', 10)
@@ -97,12 +119,15 @@ class DiffDriveController(Node):
             JointState, enc_topic, self.encoder_cb, qos_profile_sensor_data)
 
         self.timer = self.create_timer(1.0 / self.publish_rate, self.update)
+        if self.use_encoder_stamp and self.latency_report_period > 0.0:
+            self.create_timer(self.latency_report_period, self.report_latency)
 
         self.get_logger().info(
             f'diff_drive_controller up: r={self.wheel_radius} m, '
             f'L={self.wheel_separation} m, max_wheel_speed={self.max_wheel_speed} rad/s, '
             f'rate={self.publish_rate} Hz, {self.odom_frame}->{self.base_frame}, '
-            f'cmd="{cmd_topic}", encoders="{enc_topic}"')
+            f'cmd="{cmd_topic}", encoders="{enc_topic}", '
+            f'use_encoder_stamp={self.use_encoder_stamp}')
 
     # ------------------------------------------------------------------
     def cmd_vel_cb(self, msg: Twist):
@@ -150,7 +175,33 @@ class DiffDriveController(Node):
                 left_vel = -lv if self.invert_left_enc else lv
                 right_vel = -rv if self.invert_right_enc else rv
 
-        self.last_enc_time = self.get_clock().now()
+        now = self.get_clock().now()
+        self.last_enc_time = now
+
+        # When was this sample measured? ESP32 stamp if plausible, else now.
+        receive_ns = now.nanoseconds
+        if self.use_encoder_stamp:
+            stamp_ns = stamp_to_ns(msg.header.stamp.sec, msg.header.stamp.nanosec)
+            self.sample_ns, accepted, reason = select_sample_time(
+                stamp_ns, receive_ns, self.last_stamp_ns,
+                int(self.max_stamp_offset * 1e9))
+            if stamp_ns > 0:
+                self.last_stamp_ns = stamp_ns
+            if accepted:
+                latency = (receive_ns - stamp_ns) * 1e-9
+                self.lat_min = min(self.lat_min, latency)
+                self.lat_max = max(self.lat_max, latency)
+                self.lat_sum += latency
+                self.lat_count += 1
+            else:
+                self.stamp_rejected += 1
+                self.get_logger().warn(
+                    f'Encoder stamp not used ({reason}); using receive time',
+                    throttle_duration_sec=2.0)
+        else:
+            self.sample_ns = receive_ns
+        self.left_vel_meas = left_vel
+        self.right_vel_meas = right_vel
 
         # First sample: just latch the reference positions.
         if self.prev_left_pos is None:
@@ -179,6 +230,28 @@ class DiffDriveController(Node):
             left_vel, right_vel, self.wheel_radius, self.wheel_separation)
 
     # ------------------------------------------------------------------
+    def report_latency(self):
+        """Periodic log of encoder latency (receive time - ESP32 stamp)."""
+        total = self.lat_count + self.stamp_rejected
+        if total == 0:
+            return
+        if self.lat_count > 0:
+            self.get_logger().info(
+                f'encoder latency ms: min {self.lat_min * 1e3:.1f} / '
+                f'mean {self.lat_sum / self.lat_count * 1e3:.1f} / '
+                f'max {self.lat_max * 1e3:.1f}, '
+                f'stamps rejected {self.stamp_rejected}/{total}')
+        else:
+            self.get_logger().warn(
+                f'encoder stamps rejected {self.stamp_rejected}/{total}; '
+                'running on receive time (no latency compensation)')
+        self.lat_min = math.inf
+        self.lat_max = -math.inf
+        self.lat_sum = 0.0
+        self.lat_count = 0
+        self.stamp_rejected = 0
+
+    # ------------------------------------------------------------------
     def update(self):
         """50 Hz: publish wheel commands, odometry and TF."""
         now = self.get_clock().now()
@@ -192,23 +265,34 @@ class DiffDriveController(Node):
         self.right_pub.publish(Float64(data=float(self.cmd_right)))
 
         # --- Encoder staleness: report zero twist, keep last pose ---
-        if (self.last_enc_time is None or
-                (now - self.last_enc_time).nanoseconds * 1e-9 > self.encoder_timeout):
+        stale = (self.last_enc_time is None or
+                 (now - self.last_enc_time).nanoseconds * 1e-9 > self.encoder_timeout)
+        if stale:
             self.v = 0.0
             self.w = 0.0
             if self.last_enc_time is not None:
                 self.get_logger().warn('Encoder telemetry stale', throttle_duration_sec=2.0)
 
+        # --- Pose predicted from the measurement time to now (publish only;
+        # never written back, so prediction errors cannot accumulate) ---
+        x, y, theta = self.x, self.y, self.theta
+        if self.use_encoder_stamp and not stale and self.sample_ns is not None:
+            age = (now.nanoseconds - self.sample_ns) * 1e-9
+            x, y, theta = predict_pose(
+                x, y, theta, self.left_vel_meas, self.right_vel_meas, age,
+                self.wheel_radius, self.wheel_separation,
+                self.max_extrapolation_time)
+
         stamp = now.to_msg()
-        qx, qy, qz, qw = yaw_to_quaternion(self.theta)
+        qx, qy, qz, qw = yaw_to_quaternion(theta)
 
         # --- Odometry ---
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self.odom_frame
         odom.child_frame_id = self.base_frame
-        odom.pose.pose.position.x = self.x
-        odom.pose.pose.position.y = self.y
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
         odom.pose.pose.orientation.x = qx
         odom.pose.pose.orientation.y = qy
         odom.pose.pose.orientation.z = qz
@@ -226,8 +310,8 @@ class DiffDriveController(Node):
             t.header.stamp = stamp
             t.header.frame_id = self.odom_frame
             t.child_frame_id = self.base_frame
-            t.transform.translation.x = self.x
-            t.transform.translation.y = self.y
+            t.transform.translation.x = x
+            t.transform.translation.y = y
             t.transform.rotation.x = qx
             t.transform.rotation.y = qy
             t.transform.rotation.z = qz
